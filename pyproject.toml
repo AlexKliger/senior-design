@@ -16,9 +16,9 @@ dependencies = [
 readme = "README.md"
 
 [project.scripts]
-senior-design = "senior_design_project.main:main"
+senior-design = "src.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["senior_design_project*"]
+include = ["src", "src.*"]
 namespaces = false
