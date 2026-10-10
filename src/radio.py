@@ -1,4 +1,7 @@
 import adi
+import numpy as np
+
+from src.config import RadioConfig
 
 class Radio:
     def __init__(self, uri: str) -> None:
@@ -19,6 +22,25 @@ class Radio:
             raise RadioConnectionError(
                 f"Could not connect to radio at {self.uri}: {exc}"
             ) from exc
+
+    def configure_receiver(self, config: RadioConfig) -> None:
+        device = self._device
+
+        if device is None:
+            raise RuntimeError("Connect to the radio before configuring receiver.")
+
+        device.rx_lo = config.rx_center_frequency_hz
+        device.rx_rf_bandwidth = config.rx_bandwidth_hz
+        device.rx_buffer_size = config.rx_buffer_size
+        device.sample_rate = config.sample_rate_hz
+
+    def receive(self) -> np.ndarray:
+        device = self._device
+
+        if device is None:
+            raise RuntimeError("Connect to the radio before receiving samples.")
+
+        return device.rx()
 
 class RadioConnectionError(RuntimeError):
     """Raised when a connection to the radio cannot be established."""
