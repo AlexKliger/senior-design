@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pyadi-iio",
     "pylibiio==0.25",
+    "matplotlib",
 ]
 
 readme = "README.md"
