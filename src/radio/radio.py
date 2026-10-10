@@ -22,8 +22,6 @@ class Radio:
         return self._device is not None
 
     def connect(self) -> None:
-        """Receive one buffer using the existing connection."""
-
         if self.is_connected:
             return
 
@@ -56,6 +54,8 @@ class Radio:
         self._receiver_configured = True
 
     def receive(self) -> np.ndarray:
+        """Receive one buffer using the existing connection."""
+
         device = self._device
 
         if device is None:
@@ -72,5 +72,5 @@ class Radio:
             return device.rx()
         except Exception as exc:
             raise RadioReceiveError(
-                f"Could not receive sample from radio at {self.uri}: exc"
+                f"Could not receive sample from radio at {self.uri}: {exc}"
             )
