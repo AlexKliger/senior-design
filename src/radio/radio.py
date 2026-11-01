@@ -52,6 +52,11 @@ class Radio:
             device.rx_rf_bandwidth = config.rx_bandwidth_hz
             device.rx_buffer_size = config.rx_buffer_size
             device.sample_rate = config.sample_rate_hz
+
+            ###
+            device.gain_control_mode_chan0 = "manual"
+            device.rx_hardwaregain_chan0 = 10.0
+            ###
         except Exception as exc:
             raise RadioConfigurationError(
                 f"Could not configure receiver at {self.uri}: {exc}"
