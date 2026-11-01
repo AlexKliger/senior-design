@@ -23,7 +23,7 @@ def plot_spectrum(
     frequencies_hz: np.ndarray,
     magnitude_db: np.ndarray,
 ) -> None:
-    ax.plot(frequencies_hz / 1_000, magnitude_db, linewidth=0.8)
+    ax.plot(frequencies_hz, magnitude_db, linewidth=0.8)
     ax.set_title("Received IQ spectrum")
     ax.set_xlabel("Frequency offset from RX center (kHz)")
     ax.set_ylabel("FFT magnitude (dB re 1 raw FFT unit)")
