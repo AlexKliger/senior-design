@@ -1,20 +1,68 @@
 import argparse
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-
-from src.controller import RadioController
+#RadioController is configured to use if / else from hardware select branch, see lines 60 - 64
+from src.datalog import DataLogger
 from src.radio.config import RadioConfig
 from src.radio.error import RadioError
 from src.signal_processing import compute_average_power
 from src.waveforms import generate_tone
 
+# BEGIN OPTIONAL SIMULATED IQ SOURCE use python -m src.main with arg --simulate at PS terminal to activate.
+class SimulatedIQController:
+    # Equal, fixed paths plus complex Gaussian noise; no radio hardware.
+
+    def __init__(self, config: RadioConfig, seed: int = 0) -> None:
+        self.config = config
+        self._rng = np.random.default_rng(seed)
+        self._samples = np.zeros(1, dtype=np.complex128)
+        self._offset = 0
+        self.path_gain = 0.01
+        self.noise_rms = 8.0  # Expected mean squared noise magnitude is 64.
+
+    def connect(self) -> None:
+        pass  # Simulation needs no hardware connection.
+
+    def transmit(
+        self, samples_chan0, *, samples_chan1=None, cyclic=False
+    ) -> None:
+        if not cyclic:
+            raise ValueError("This simulator supports cyclic transmission only.")
+        self._samples = self.path_gain * np.asarray(samples_chan0)
+        if samples_chan1 is not None:
+            self._samples = self._samples + self.path_gain * np.asarray(samples_chan1)
+        self._offset = 0
+
+    def receive(self) -> np.ndarray:
+        count = self.config.rx_buffer_size
+        indices = (self._offset + np.arange(count)) % self._samples.size
+        self._offset = (self._offset + count) % self._samples.size
+        noise = self.noise_rms / np.sqrt(2) * (
+            self._rng.standard_normal(count)
+            + 1j * self._rng.standard_normal(count)
+        )
+        return self._samples[indices] + noise
+
+    def stop_transmission(self) -> None:
+        self._samples = np.zeros(1, dtype=np.complex128)
+        self._offset = 0
+# END OPTIONAL SIMULATED IQ SOURCE
+
+
 def main() -> None:
     args = parse_args()
 
     config = RadioConfig()
-    controller = RadioController(config)
+    # Simulation selection: omit --simulate for the real radio.
+    if args.simulate:
+        controller = SimulatedIQController(config)
+    else:
+        from src.controller import RadioController
+        controller = RadioController(config)
 
     phases_deg = list(range(0, 361, 10))
     completed_sweeps = []
@@ -24,165 +72,186 @@ def main() -> None:
     buffers_to_discard = 8
     buffers_to_average = 10
 
+    log_prefix = "simulated" if args.simulate else "measurements"
+    log_path = args.log_csv or Path(__file__).resolve().parent / (
+        f"{log_prefix}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S_%fZ}.csv"
+    )
+
     try:
-        controller.connect()
-        print(f"Connection to radio at {controller.config.uri}.")
-        print(
-            f"Running {total_sweeps} phase sweeps: "
-            f"{subplot_count} groups of {args.sweeps}. Press Ctrl+C to stop."
-        )
+        with DataLogger(log_path) as logger:
+            print(f"Recording measurements to {log_path}", flush=True)
+            controller.connect()
+            if args.simulate:
+                print("SIMULATION: generated IQ only; no radio connected (seed=0).")
+            else:
+                print(f"Connection to radio at {controller.config.uri}.")
+            print(
+                f"Running {total_sweeps} phase sweeps: "
+                f"{subplot_count} groups of {args.sweeps}. Press Ctrl+C to stop."
+            )
 
-        samples_outgoing_chan0 = generate_tone(
-            frequency_hz=100_000,
-            sample_rate_hz=config.sample_rate_hz,
-            sample_count=16_000,
-            amplitude=8_000,
-        )
+            samples_outgoing_chan0 = generate_tone(
+                frequency_hz=100_000,
+                sample_rate_hz=config.sample_rate_hz,
+                sample_count=16_000,
+                amplitude=8_000,
+            )
 
-        # Measure one reference with only TX channel 0 enabled.
-        controller.transmit(
-            samples_chan0=samples_outgoing_chan0,
-            cyclic=True,
-        )
-        time.sleep(0.05)
-        for _ in range(buffers_to_discard):
-            controller.receive()
-
-        total_reference_power = 0.0
-        for _ in range(buffers_to_average):
-            samples = controller.receive()
-            total_reference_power += compute_average_power(samples)
-
-        single_antenna_power = total_reference_power / buffers_to_average
-        if not np.isfinite(single_antenna_power) or single_antenna_power <= 0:
-            raise RadioError("Single-antenna reference power must be finite and positive.")
-        print(
-            f"TX0-only average received power: {single_antenna_power:.6g} "
-            "raw sample units squared (0 dB reference).",
-            flush=True,
-        )
-
-        for sweep_index in range(total_sweeps):
-            group_index, run_index = divmod(sweep_index, args.sweeps)
-            sweep_powers = []
-
-            for phase_deg in phases_deg:
-                samples_outgoing_chan1 = generate_tone(
-                    frequency_hz=100_000,
-                    sample_rate_hz=config.sample_rate_hz,
-                    sample_count=16_000,
-                    amplitude=8_000,
-                    phase_shift_deg=phase_deg,
-                )
-
-                controller.transmit(
-                    samples_chan0=samples_outgoing_chan0,
-                    samples_chan1=samples_outgoing_chan1,
-                    cyclic=True,
-                )
-
-                # Allow the new transmission to settle.
+            # Measure one reference with only TX channel 0 enabled.
+            controller.transmit(
+                samples_chan0=samples_outgoing_chan0,
+                cyclic=True,
+            )
+            if not args.simulate:
                 time.sleep(0.05)
+            for _ in range(buffers_to_discard):
+                controller.receive()
 
-                # Drain samples that may belong to the previous phase.
-                for _ in range(buffers_to_discard):
-                    controller.receive()
+            total_reference_power = 0.0
+            for _ in range(buffers_to_average):
+                samples = controller.receive()
+                total_reference_power += compute_average_power(samples)
 
-                total_power = 0.0
-                for _ in range(buffers_to_average):
-                    samples = controller.receive()
-                    total_power += compute_average_power(samples)
+            single_antenna_power = total_reference_power / buffers_to_average
+            if not np.isfinite(single_antenna_power) or single_antenna_power <= 0:
+                raise RadioError("Single-antenna reference power must be finite and positive.")
+            print(
+                f"TX0-only average received power: {single_antenna_power:.6g} "
+                "raw sample units squared (0 dB reference).",
+                flush=True,
+            )
 
-                # Keep linear power for averaging across sweeps.
-                average_power = total_power / buffers_to_average
-                sweep_powers.append(average_power)
-                power_db = float(
-                    10 * np.log10(
-                        max(average_power, 1e-12) / single_antenna_power
+            for sweep_index in range(total_sweeps):
+                group_index, run_index = divmod(sweep_index, args.sweeps)
+                sweep_powers = []
+
+                for phase_deg in phases_deg:
+                    samples_outgoing_chan1 = generate_tone(
+                        frequency_hz=100_000,
+                        sample_rate_hz=config.sample_rate_hz,
+                        sample_count=16_000,
+                        amplitude=8_000,
+                        phase_shift_deg=phase_deg,
                     )
-                )
 
-                print(
-                    f"Group {group_index + 1}/{subplot_count} | "
-                    f"Run {run_index + 1}/{args.sweeps} | "
-                    f"Phase: {phase_deg:3d}° | "
-                    f"Received power: {power_db:.2f} dB relative to TX0 only",
-                    flush=True,
-                )
+                    controller.transmit(
+                        samples_chan0=samples_outgoing_chan0,
+                        samples_chan1=samples_outgoing_chan1,
+                        cyclic=True,
+                    )
 
-            # Include only complete sweeps so every phase has equal weight.
-            completed_sweeps.append(sweep_powers)
+                    # Allow the new transmission to settle.
+                    if not args.simulate:
+                        time.sleep(0.05)
 
-        # samples_outgoing_chan0 = generate_tone(
-        #     frequency_hz=args.frequency0,
-        #     sample_rate_hz=config.sample_rate_hz,
-        #     sample_count=16_000,
-        #     amplitude=args.amplitude0,
-        #     phase_shift_deg=args.phase0,
-        # )
+                    # Drain samples that may belong to the previous phase.
+                    for _ in range(buffers_to_discard):
+                        controller.receive()
 
-        # samples_outgoing_chan1 = generate_tone(
-        #     frequency_hz=args.frequency1,
-        #     sample_rate_hz=config.sample_rate_hz,
-        #     sample_count=16_000,
-        #     amplitude=args.amplitude1,
-        #     phase_shift_deg=args.phase1,
-        # )
+                    total_power = 0.0
+                    for _ in range(buffers_to_average):
+                        samples = controller.receive()
+                        total_power += compute_average_power(samples)
 
-        # controller.transmit(
-        #     samples_outgoing_chan0,
-        #     samples_chan1=samples_outgoing_chan1,
-        #     cyclic=True,
-        # )
+                    # Keep linear power for averaging across sweeps.
+                    average_power = total_power / buffers_to_average
+                    sweep_powers.append(average_power)
+                    power_db = float(
+                        10 * np.log10(
+                            max(average_power, 1e-12) / single_antenna_power
+                        )
+                    )
 
-        # samples_incoming = controller.receive()
+                    logger.log(
+                        group_index=group_index + 1,
+                        sweep_index=run_index + 1,
+                        commanded_phase_deg=phase_deg,
+                        rx_power_raw_sq=average_power,
+                        tx0_reference_power_raw_sq=single_antenna_power,
+                        relative_power_db=power_db,
+                    )
 
-        # total_squared_magnitude = 0.0
-        # total_sample_count = 0
+                    print(
+                        f"Group {group_index + 1}/{subplot_count} | "
+                        f"Run {run_index + 1}/{args.sweeps} | "
+                        f"Phase: {phase_deg:3d}° | "
+                        f"Received power: {power_db:.2f} dB relative to TX0 only",
+                        flush=True,
+                    )
 
-        # for _ in range(1000):
-        #     samples_incoming = controller.receive()
+                # Include only complete sweeps so every phase has equal weight.
+                completed_sweeps.append(sweep_powers)
 
-        #     total_squared_magnitude += (
-        #         compute_average_power(samples_incoming) * samples_incoming.size
-        #     )
-        #     total_sample_count += samples_incoming.size
+            # samples_outgoing_chan0 = generate_tone(
+            #     frequency_hz=args.frequency0,
+            #     sample_rate_hz=config.sample_rate_hz,
+            #     sample_count=16_000,
+            #     amplitude=args.amplitude0,
+            #     phase_shift_deg=args.phase0,
+            # )
 
-        # average_power = total_squared_magnitude / total_sample_count
-        # print(f"Average power: {average_power}", flush=True)
+            # samples_outgoing_chan1 = generate_tone(
+            #     frequency_hz=args.frequency1,
+            #     sample_rate_hz=config.sample_rate_hz,
+            #     sample_count=16_000,
+            #     amplitude=args.amplitude1,
+            #     phase_shift_deg=args.phase1,
+            # )
+
+            # controller.transmit(
+            #     samples_outgoing_chan0,
+            #     samples_chan1=samples_outgoing_chan1,
+            #     cyclic=True,
+            # )
+
+            # samples_incoming = controller.receive()
+
+            # total_squared_magnitude = 0.0
+            # total_sample_count = 0
+
+            # for _ in range(1000):
+            #     samples_incoming = controller.receive()
+
+            #     total_squared_magnitude += (
+            #         compute_average_power(samples_incoming) * samples_incoming.size
+            #     )
+            #     total_sample_count += samples_incoming.size
+
+            # average_power = total_squared_magnitude / total_sample_count
+            # print(f"Average power: {average_power}", flush=True)
 
 
-        # frequencies_hz, magnitude_db = compute_spectrum(
-        #     samples=samples_incoming,
-        #     sample_rate_hz=config.sample_rate_hz,
-        # )
+            # frequencies_hz, magnitude_db = compute_spectrum(
+            #     samples=samples_incoming,
+            #     sample_rate_hz=config.sample_rate_hz,
+            # )
 
-        # fig, ax = plt.subplots(figsize=(12, 5))
+            # fig, ax = plt.subplots(figsize=(12, 5))
 
-        # plot_spectrum(
-        #     ax=ax,
-        #     frequencies_hz=frequencies_hz,
-        #     magnitude_db=magnitude_db,
-        # )
+            # plot_spectrum(
+            #     ax=ax,
+            #     frequencies_hz=frequencies_hz,
+            #     magnitude_db=magnitude_db,
+            # )
 
-        # spectrum_line = ax.lines[0]
-        # ax.set_ylim(-20, 160)
-        # fig.tight_layout()
-        # plt.show(block=False)
+            # spectrum_line = ax.lines[0]
+            # ax.set_ylim(-20, 160)
+            # fig.tight_layout()
+            # plt.show(block=False)
 
-        set_of_samples = []
-        samples_count = 0
+            set_of_samples = []
+            samples_count = 0
 
-        # while plt.fignum_exists(fig.number):
-        #     samples = controller.receive()
-        #     _, magnitude_db = compute_spectrum(
-        #         samples=samples,
-        #         sample_rate_hz=config.sample_rate_hz,
-        #     )
+            # while plt.fignum_exists(fig.number):
+            #     samples = controller.receive()
+            #     _, magnitude_db = compute_spectrum(
+            #         samples=samples,
+            #         sample_rate_hz=config.sample_rate_hz,
+            #     )
 
-        #     spectrum_line.set_ydata(magnitude_db)
-        #     fig.canvas.draw_idle()
-        #     plt.pause(0.001)
+            #     spectrum_line.set_ydata(magnitude_db)
+            #     fig.canvas.draw_idle()
+            #     plt.pause(0.001)
 
     except KeyboardInterrupt:
         print("\nSweep interrupted. Only complete groups will be plotted.")
@@ -235,10 +304,11 @@ def main() -> None:
             f"Best measured phase: {best_phase}°"
         )
         ax.grid(True)
-
+# adds simulate IQ when the --simulate argument is used at PS terminal
     fig.supxlabel("Channel 1 phase relative to channel 0 (degrees)")
     fig.supylabel("Mean received power relative to TX0 only (dB)")
     fig.suptitle(
+        ("SIMULATED IQ — " if args.simulate else "") +
         f"Received power versus transmit phase: "
         f"{args.sweeps} runs per subplot"
     )
@@ -257,6 +327,18 @@ def main() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Transmit two tones with independent phase shifts."
+    )
+
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Use repeatable simulated IQ instead of connecting to the radio.",
+    )
+
+    parser.add_argument(
+        "--log-csv",
+        type=Path,
+        help="New CSV output path (default: timestamped file beside main.py).",
     )
 
     parser.add_argument(
